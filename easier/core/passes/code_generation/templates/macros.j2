@@ -1,0 +1,86 @@
+{% macro forward_args(tensor_args, index_args) %}
+    {%- for arg in tensor_args -%}
+        torch::Tensor& {{arg}}{{', '}}
+    {%- endfor -%}
+    {%- for arg in index_args -%}
+        torch::Tensor& {{arg}}{{', '}}
+    {%- endfor -%}
+    torch::Tensor& row_end_offsets
+{%- endmacro %}
+
+{% macro kernel_args(tensor_args, index_args, ValueT, OffsetT) %}
+    {%- for arg in tensor_args -%}
+        {{ValueT}}* {{arg}}_input{{', '}}
+    {%- endfor -%}
+    {%- for arg in index_args -%}
+        {{OffsetT}}* {{arg}}_input{{', '}}
+    {%- endfor -%}
+    {{OffsetT}}* row_end_offsets
+{%- endmacro %}
+
+{% macro invoke_args(tensor_args, index_args, ValueT, OffsetT) %}
+    {%- for arg in tensor_args -%}
+        {{arg}}.data_ptr<{{ValueT}}>(){{', '}}
+    {%- endfor -%}
+    {%- for arg in index_args -%}
+        {{arg}}.data_ptr<{{OffsetT}}>(){{', '}}
+    {%- endfor -%}
+    row_end_offsets.data_ptr<{{OffsetT}}>()
+{%- endmacro %}
+
+{%- macro ident(level) %}
+{%- for _ in range(level) %}  {% endfor %}
+{%- endmacro %}
+
+{%- macro emit_tensor_buffer(level, tensor_args, replica_outputs, replica_inputs, ValueT) -%}
+{%- for arg, extent in tensor_args.items() %}
+{%- if arg not in replica_outputs and arg not in replica_inputs %}
+{{ident(level)}}{{ValueT}}* {{arg}} = {{arg}}_input + {{extent}} * thread_coord.y;
+{%- else %}
+{{ident(level)}}{{ValueT}}* {{arg}} = {{arg}}_input;
+{%- endif -%}
+{%- endfor -%}
+{%- endmacro %}
+
+{%- macro emit_index_buffer(level, index_args, OffsetT) -%}
+{%- for arg in index_args %}
+{{ident(level)}}{{OffsetT}}* {{arg}}_idx = {{arg}}_input + thread_coord.y;
+{%- endfor -%}
+{%- endmacro %}
+
+{%- macro emit_tmp_buffer(level, tensor_args, nodes, ValueT) -%}
+{%- for node, extent in nodes.items() %}
+{%- if node not in tensor_args %}
+{{ident(level)}}{{ValueT}} {{node}}[{{extent}}];
+{%- endif -%}
+{%- endfor -%}
+{%- endmacro %}
+
+{%- macro emit_compute(level, compute) -%}
+{%- for line in compute %}
+{{ident(level)}}{{line}}
+{%- endfor -%}
+{%- endmacro -%}
+
+
+{#
+{%- macro emit_compute(level, tensor_args, index_args, nodes, ValueT, OffsetT, compute) -%}
+{%- for arg, extent in tensor_args.items() %}
+{{ident(level)}}{{ValueT}}* {{arg}} = {{arg}}_input + {{extent}} * thread_coord.y;
+{%- endfor -%}
+{%- for arg in index_args %}
+{{ident(level)}}{{OffsetT}}* {{arg}}_idx = {{arg}}_input + thread_coord.y;
+{%- endfor -%}
+{% for node, extent in nodes.items() %}
+{%- if node not in tensor_args %}
+{{ident(level)}}{{ValueT}} {{node}}[{{extent}}];
+{%- endif -%}
+{%- endfor -%}
+{% for line in compute %}
+{{ident(level)}}{{line}}
+{%- endfor %}
+{%- endmacro %}
+#}
+
+
+

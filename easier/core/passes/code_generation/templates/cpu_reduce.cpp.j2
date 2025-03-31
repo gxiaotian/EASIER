@@ -1,0 +1,80 @@
+{%- from "macros.j2" import forward_args, kernel_args, invoke_args,
+    emit_tensor_buffer, emit_index_buffer, emit_tmp_buffer, emit_compute -%}
+
+void {{name}}_kernel({{kernel_args(tensor_args, index_args, ValueT, OffsetT)}}) {
+
+  {%- for reducer, extent in reducers.items() %}
+  {{OffsetT}} {{reducer}}_row_carry_out[{{num_threads}}];
+  {%- endfor %}
+
+  {%- for reducer, extent in reducers.items() %}
+  {{ValueT}} {{reducer}}_value_carry_out[{{extent}}*{{num_threads}}];
+  {%- endfor %}
+
+  #pragma omp parallel for schedule(static) num_threads({{num_threads}})
+  for (int tid = 0; tid < {{num_threads}}; ++tid) {
+    CountingInputIterator<{{OffsetT}}>  nonzero_indices(0);
+    {{OffsetT}} num_merge_items = {{num_rows}} + {{num_nonzeros}};
+    {{OffsetT}} items_per_thread = (num_merge_items + {{num_threads}} - 1) / {{num_threads}};
+
+    int2 thread_coord;
+    int2 thread_coord_end;
+    int  start_diagonal = std::min(items_per_thread * tid, num_merge_items);
+    int  end_diagonal = std::min(start_diagonal + items_per_thread, num_merge_items);
+    MergePathSearch(start_diagonal, row_end_offsets, nonzero_indices, {{num_rows}}, {{num_nonzeros}}, thread_coord);
+    MergePathSearch(end_diagonal, row_end_offsets, nonzero_indices, {{num_rows}}, {{num_nonzeros}}, thread_coord_end);
+
+    for (; thread_coord.x < thread_coord_end.x; ++thread_coord.x) {
+      {%- for reducer, extent in reducers.items() %}
+      {{ValueT}} {{reducer}}_running_total[{{extent}}] = {0.0};
+      {%- endfor %}
+      for (; thread_coord.y < row_end_offsets[thread_coord.x]; ++thread_coord.y) {
+        {{- emit_tensor_buffer(4, tensor_args, replica_outputs, replica_inputs, ValueT)}}
+        {{- emit_index_buffer(4, index_args, OffsetT)}}
+        {{- emit_tmp_buffer(4, tensor_args, nodes, ValueT)}}
+        {{- emit_compute(4, compute)}}
+      }
+      {% for reducer, extent in reducers.items() %}
+      for (int i = 0; i < {{extent}}; ++i) {
+        {%- if reducer not in inplace_reducers.keys() %}
+        {{reducer}}_input[thread_coord.x*{{extent}} + i] = {{reducer}}_running_total[i];
+        {%- else %}
+        {{inplace_reducers[reducer]}}_input[thread_coord.x*{{extent}} + i] += {{reducer}}_running_total[i];
+        {%- endif %}
+      }
+      {%- endfor %}
+    }
+    {% for reducer, extent in reducers.items() %}
+    {{ValueT}} {{reducer}}_running_total[{{extent}}] = {0.0};
+    {%- endfor %}
+    for (; thread_coord.y < thread_coord_end.y; ++thread_coord.y) {
+      {{- emit_tensor_buffer(3, tensor_args, replica_outputs, replica_inputs, ValueT)}}
+      {{- emit_index_buffer(3, index_args, OffsetT)}}
+      {{- emit_tmp_buffer(3, tensor_args, nodes, ValueT)}}
+      {{- emit_compute(3, compute)}}
+    }
+    {% for reducer, extent in reducers.items() %}
+    {{reducer}}_row_carry_out[tid] = thread_coord_end.x;
+    for (int i=0; i < {{extent}}; ++i) {
+      {{reducer}}_value_carry_out[tid*{{extent}}+i] = {{reducer}}_running_total[i];
+    }
+    {%- endfor %}
+  }
+
+  for(int tid = 0; tid < {{num_threads}} - 1; ++tid) {
+    {%- for reducer, extent in reducers.items() %}
+    if ({{reducer}}_row_carry_out[tid] < {{num_rows}}) {
+      for(int i=0; i < {{extent}}; ++i) {
+        {%- if reducer not in inplace_reducers.keys() %}
+        {{reducer}}_input[{{reducer}}_row_carry_out[tid]*{{extent}}+i] += {{reducer}}_value_carry_out[tid*{{extent}}+i];
+        {%- else %}
+        {{inplace_reducers[reducer]}}_input[{{reducer}}_row_carry_out[tid]*{{extent}}+i] += {{reducer}}_value_carry_out[tid*{{extent}}+i];
+        {%- endif %}
+      }
+    }
+    {%- endfor %}
+  }
+}
+void {{name}}({{forward_args(tensor_args, index_args)}}) {
+  {{name}}_kernel({{invoke_args(tensor_args, index_args, ValueT, OffsetT)}});
+}

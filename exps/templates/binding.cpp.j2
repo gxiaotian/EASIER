@@ -1,0 +1,6 @@
+{%- from "macros.j2" import kernel_args, forward_args, invoke_args -%}
+
+void {{name}}({{kernel_args(tensor_args, index_args, ValueT, OffsetT)}});
+void {{name}}({{forward_args(tensor_args, index_args)}}) {
+  {{name}}({{invoke_args(tensor_args, index_args, ValueT, OffsetT)}});
+}

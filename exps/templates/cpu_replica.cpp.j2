@@ -1,0 +1,38 @@
+{%- from "macros.j2" import kernel_args, emit_tensor_buffer, emit_index_buffer, emit_tmp_buffer, emit_compute -%}
+
+void {{name}}_kernel({{kernel_args(tensor_args, index_args, ValueT, OffsetT)}}) {
+  {%- for node, extent in replica_outputs.items() %}
+  {{ValueT}} {{node}}_total[{{num_threads}} * {{extent}}] = {0.0};
+  {%- endfor %}
+  #pragma omp parallel for schedule(static) num_threads({{num_threads}})
+  for (int tid = 0; tid < {{num_threads}}; ++tid) {
+    int items_per_thread = ({{num_rows}} + {{num_threads}} - 1) / {{num_threads}};
+
+    int2 thread_coord;
+    int2 thread_coord_end;
+    thread_coord.y = std::min(items_per_thread * tid, {{num_rows}});
+    thread_coord_end.y = std::min(thread_coord.y + items_per_thread, {{num_rows}});
+
+    {%- for node, extent in replica_outputs.items() %}
+    {{ValueT}}* {{node}}_running_total = {{node}}_total + tid * {{extent}};
+    {%- endfor %}
+
+    for (; thread_coord.y < thread_coord_end.y; ++thread_coord.y) {
+      {{- emit_tensor_buffer(3, tensor_args, replica_outputs, replica_inputs, ValueT)}}
+      {{- emit_index_buffer(3, index_args, OffsetT)}}
+      {{- emit_tmp_buffer(3, tensor_args, nodes, ValueT)}}
+      {{- emit_compute(3, compute)}}
+    }
+  }
+
+  for(int tid = 0; tid < {{num_threads}}; ++tid) {
+    {%- for node, extent in replica_outputs.items() %}
+    for (int i = 0; i < {{extent}}; ++i) {
+      {{node}}_input[i] += {{node}}_total[tid*{{extent}}+i];
+    }
+    {%- endfor %}
+  }
+  {%- for node, extent in replica_outputs.items() -%}
+  {{emit_compute(1, post_proc[node])}}
+  {%- endfor %}
+}

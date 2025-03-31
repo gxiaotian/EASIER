@@ -1,0 +1,24 @@
+{%- from "macros.j2" import forward_args, kernel_args, invoke_args,
+    emit_tensor_buffer, emit_index_buffer, emit_tmp_buffer, emit_compute -%}
+
+void {{name}}_kernel({{kernel_args(tensor_args, index_args, ValueT, OffsetT)}}) {
+  #pragma omp parallel for schedule(static) num_threads({{num_threads}})
+  for (int tid = 0; tid < {{num_threads}}; ++tid) {
+    int items_per_thread = ({{num_rows}} + {{num_threads}} - 1) / {{num_threads}};
+
+    int2 thread_coord;
+    int2 thread_coord_end;
+    thread_coord.y = std::min(items_per_thread * tid, {{num_rows}});
+    thread_coord_end.y = std::min(thread_coord.y + items_per_thread, {{num_rows}});
+
+    for (; thread_coord.y < thread_coord_end.y; ++thread_coord.y) {
+      {{- emit_tensor_buffer(3, tensor_args, replica_outputs, replica_inputs, ValueT)}}
+      {{- emit_index_buffer(3, index_args, OffsetT)}}
+      {{- emit_tmp_buffer(3, tensor_args, nodes, ValueT)}}
+      {{- emit_compute(3, compute)}}
+    }
+  }
+}
+void {{name}}({{forward_args(tensor_args, index_args)}}) {
+  {{name}}_kernel({{invoke_args(tensor_args, index_args, ValueT, OffsetT)}});
+}
