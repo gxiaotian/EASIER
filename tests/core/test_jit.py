@@ -15,16 +15,10 @@ from easier.core.passes.utils import OrderedSet
 from easier.examples import Poisson
 from easier.core.runtime.dist_env import DummyDistEnv
 
-from ..utils import mpirun_singlenode, get_random_str
-
-
-@pytest.fixture(scope='function')
-def singleton_dist_env_mock():
-    with patch('easier.core.runtime.dist_env._get_or_init_dist_env') as mock:
-        def _get_or_init(backend: str):
-            return DummyDistEnv(backend)  # type: ignore
-        mock.side_effect = _get_or_init
-        yield mock
+from tests.utils import \
+    torchrun_singlenode, get_random_str, \
+    mpi_e2e, mpirun_singlenode
+from tests.core.utils import multi_stage_zero_length_partition
 
 
 class Model(esr.Module):
@@ -59,6 +53,7 @@ class Model(esr.Module):
         self.out1[:] = esr.norm(res, 2)[0]
 
 
+@pytest.mark.usefixtures('dummy_dist_env')
 def test_jit_nnModule():
     """test whether easier ops are jitted as leaf node"""
     m = Model(3)
@@ -77,7 +72,8 @@ def test_jit_nnModule():
                 getattr(jitted, node.target), esr.Reducer)
 
 
-def test_jit_tensors(singleton_dist_env_mock):
+@pytest.mark.usefixtures('dummy_dist_env')
+def test_jit_tensors():
     """test whether easier tensors are mutable after jitted"""
 
     torch.manual_seed(2345)
@@ -97,7 +93,8 @@ def test_jit_tensors(singleton_dist_env_mock):
         jitted_res1, nonjitted_res1))  # type: ignore
 
 
-def test_jit_orphan_tensors(singleton_dist_env_mock):
+@pytest.mark.usefixtures('dummy_dist_env')
+def test_jit_orphan_tensors():
     """
     Test that Tensors that are not involved in Selector-Reducer pairs
     are properly partitioned.
@@ -115,7 +112,7 @@ def test_jit_orphan_tensors(singleton_dist_env_mock):
             self.v[:] = self.v + 3
 
     m = M()
-    jitted, = esr.compile([m])  # type: ignore
+    jitted, = esr.compile([m], 'torch')  # type: ignore
     jitted: M
     jitted()
     v = jitted.v.collect()
@@ -133,6 +130,7 @@ def test_jit_orphan_tensors(singleton_dist_env_mock):
     assert jitted.v2.elempart.lengths[0] == 13  # type: ignore
 
 
+@pytest.mark.usefixtures('dummy_dist_env')
 def test_nested_easier_modules():
     class Inner(esr.Module):
         def __init__(self):
@@ -157,7 +155,7 @@ def test_nested_easier_modules():
             self.inner.v[:] = self.r(k)
 
     outer = Outer()
-    j_outer, = esr.compile([outer])
+    j_outer, = esr.compile([outer], 'torch')
 
     g: Graph = j_outer.forward.__self__.graph  # type: ignore
     for n in g.nodes:
@@ -169,7 +167,6 @@ def test_nested_easier_modules():
 
 def worker__test_collect(local_rank: int, world_size: int,
                          dev_type: str, jit_backend: str):
-
     if dev_type == 'cpu':
         model_dev = 'cpu'
     else:
@@ -180,15 +177,17 @@ def worker__test_collect(local_rank: int, world_size: int,
     m, = esr.compile(
         [Model(3, model_dev)], backend='none')
     m()
+    m()
 
-    orig_vertex = m.vertex_tensor.clone()
-    orig_edge = m.edge_tensor.clone()
-    orig_replica = m.tensor.clone()
+    orig_vertex = m.vertex_tensor.clone().cpu()
+    orig_edge = m.edge_tensor.clone().cpu()
+    orig_replica = m.tensor.clone().cpu()
 
     torch.manual_seed(2345)
     jitted, = esr.compile(
         [Model(3, model_dev)], backend=jit_backend)  # type: ignore
     jitted: Model
+    jitted()
     jitted()
 
     # Simple test that partition is really done.
@@ -199,21 +198,24 @@ def worker__test_collect(local_rank: int, world_size: int,
     collected_replica = jitted.tensor.collect()
     assert collected_vertex.device == model_dev
     assert collected_edge.device == model_dev
-    assert collected_vertex.device == model_dev
-    torch.testing.assert_close(collected_vertex, orig_vertex)
-    torch.testing.assert_close(collected_edge, orig_edge)
-    torch.testing.assert_close(collected_replica, orig_replica)
+    assert collected_replica.device == model_dev
+    torch.testing.assert_close(collected_vertex.cpu(), orig_vertex)
+    torch.testing.assert_close(collected_edge.cpu(), orig_edge)
+    torch.testing.assert_close(collected_replica.cpu(), orig_replica)
 
     if jit_backend == 'torch':
-        comm_dev = model_dev
-    elif jit_backend == 'cpu':
-        comm_dev = 'cpu'
-    elif jit_backend == 'gpu':
-        comm_dev = f'cuda:{local_rank}'
-    comm_dev = torch.device(comm_dev)  # type: ignore
+        comm_dev_type = model_dev.type
+    else:
+        comm_dev_type = jit_backend
 
     from easier.core.runtime.dist_env import get_runtime_dist_env
-    assert get_runtime_dist_env().comm_device == comm_dev
+    if comm_dev_type == 'cpu':
+        assert get_runtime_dist_env().comm_device.type == 'cpu'
+    elif comm_dev_type == 'cuda':
+        assert get_runtime_dist_env().comm_device.type == 'cuda'
+        assert get_runtime_dist_env().comm_device.index == local_rank
+    else:
+        assert False
 
 
 def worker__test_save(local_rank: int, world_size: int,
@@ -223,6 +225,7 @@ def worker__test_save(local_rank: int, world_size: int,
     torch.manual_seed(2345)
     m, = esr.compile([Model(3, model_dev)], backend='none')
     m()
+    m()
 
     orig_vertex = m.vertex_tensor.data.to(device='cpu', copy=True)
     orig_edge = m.edge_tensor.data.to(device='cpu', copy=True)
@@ -230,12 +233,149 @@ def worker__test_save(local_rank: int, world_size: int,
 
     torch.manual_seed(2345)
     jitted, = esr.compile(
-        [Model(3, model_dev)], backend='torch')  # type: ignore
+        [Model(3, model_dev)], backend='torch'  # type: ignore
+    )
     jitted: Model
+    jitted()
     jitted()
 
     # Simple test that partition is really done.
     assert jitted.vertex_tensor.shape[0] < orig_vertex.shape[0]
+
+    if local_rank == 0:
+        fn = get_random_str() + ".hdf5"
+        dir = os.path.join(tempfile.gettempdir(), "easier", "tests")
+        os.makedirs(dir, exist_ok=True)
+        fpath = os.path.join(dir, fn)
+    else:
+        fpath = None
+
+    from easier.core.module import _dist_save as _orig_dist_save
+
+    def _dist_save_with_chunk_size(tensor, h5d, *, chunk_size=None):
+        # Test when chuck size is smaller than the dataset size.
+        return _orig_dist_save(tensor, h5d, chunk_size=13)
+
+    with patch(f'{_orig_dist_save.__module__}._dist_save') as mock_dist_save:
+        mock_dist_save.side_effect = _dist_save_with_chunk_size
+
+        jitted.vertex_tensor.save(fpath, 'vertex')
+        jitted.edge_tensor.save(fpath, 'edge')
+        jitted.tensor.save(fpath, 'replica')
+
+        # replica.save() does not call _dist_save()
+        assert mock_dist_save.call_count == 2
+
+    if local_rank == 0:
+        with h5py.File(fpath, 'r') as h5f:
+            torch.testing.assert_close(
+                torch.from_numpy(h5f['vertex'][:]), orig_vertex)
+            torch.testing.assert_close(
+                torch.from_numpy(h5f['edge'][:]), orig_edge)
+            torch.testing.assert_close(
+                torch.from_numpy(h5f['replica'][:]), orig_replica)
+
+
+when_ngpus_ge_2 = pytest.mark.skipif(
+    torch.cuda.device_count() < 2,
+    reason="no enough CUDA GPU (ngpus >= 2) to test distribution")
+
+
+@pytest.mark.parametrize('xrun_singlenode', [
+    torchrun_singlenode,
+    pytest.param(mpirun_singlenode, marks=mpi_e2e)
+])
+class TestJittedUsage:
+
+    @pytest.mark.parametrize('dev_type', [
+        'cpu',
+        pytest.param('cuda', marks=when_ngpus_ge_2)
+    ])
+    @pytest.mark.parametrize('jit_backend', [
+        'torch',
+        'cpu',
+        pytest.param('cuda', marks=when_ngpus_ge_2)
+    ])
+    def test_collect(
+        self, xrun_singlenode, dev_type: str, jit_backend: str
+    ):
+        if jit_backend == 'torch':
+            init_type = dev_type
+        else:
+            init_type = jit_backend
+        xrun_singlenode(
+            2, worker__test_collect,
+            (dev_type, jit_backend),
+            init_type=init_type  # type: ignore
+        )
+
+    @pytest.mark.parametrize('dev_type', [
+        'cpu',
+        pytest.param('cuda', marks=when_ngpus_ge_2)
+    ])
+    def test_save(self, xrun_singlenode, dev_type: str):
+        xrun_singlenode(
+            2, worker__test_save, (dev_type,),
+            init_type=dev_type  # type: ignore
+        )
+
+
+def worker__test_zerolength_collect(local_rank: int, world_size: int, dev_type):
+    torch.manual_seed(2345)
+    m = Model(3, 'cpu')
+    [m] = esr.compile([m], backend='none')
+    m()
+    m()
+
+    orig_vertex = m.vertex_tensor.clone()
+    orig_edge = m.edge_tensor.clone()
+    orig_replica = m.tensor.clone()
+
+    torch.manual_seed(2345)
+    m = Model(3, 'cpu')
+
+    with multi_stage_zero_length_partition((m.vertex_tensor, m.edge_tensor)):
+        [jitted] = esr.compile([m], backend=dev_type)  # type: ignore
+    jitted: Model
+    jitted()
+    jitted()
+
+    # Simple test that partition is really done.
+    if local_rank == 0:
+        assert jitted.vertex_tensor.shape[0] == 0
+        assert jitted.edge_tensor.shape[0] == 0
+
+    collected_vertex = jitted.vertex_tensor.collect()
+    collected_edge = jitted.edge_tensor.collect()
+    collected_replica = jitted.tensor.collect()
+    torch.testing.assert_close(collected_vertex, orig_vertex)
+    torch.testing.assert_close(collected_edge, orig_edge)
+    torch.testing.assert_close(collected_replica, orig_replica)
+
+
+def worker__test_zerolength_save(local_rank: int, world_size: int, dev_type):
+    torch.manual_seed(2345)
+    m, = esr.compile([Model(3, 'cpu')], backend='none')
+    m()
+    m()
+
+    orig_vertex = m.vertex_tensor.data.to(device='cpu', copy=True)
+    orig_edge = m.edge_tensor.data.to(device='cpu', copy=True)
+    orig_replica = m.tensor.data.to(device='cpu', copy=True)
+
+    torch.manual_seed(2345)
+    m = Model(3, 'cpu')
+
+    with multi_stage_zero_length_partition((m.vertex_tensor, m.edge_tensor)):
+        [jitted] = esr.compile([m], backend=dev_type)  # type: ignore
+    jitted: Model
+    jitted()
+    jitted()
+
+    # Simple test that partition is really done.
+    if local_rank == 0:
+        assert jitted.vertex_tensor.shape[0] == 0
+        assert jitted.edge_tensor.shape[0] == 0
 
     if local_rank == 0:
         fn = get_random_str() + ".hdf5"
@@ -259,28 +399,80 @@ def worker__test_save(local_rank: int, world_size: int,
                 torch.from_numpy(h5f['replica'][:]), orig_replica)
 
 
-when_ngpus_ge_2 = pytest.mark.skipif(
-    torch.cuda.device_count() < 2,
-    reason="no enough CUDA GPU (ngpus >= 2) to test distribution")
+class NotFullModel(esr.Module):
+    def __init__(self):
+        super().__init__()
+
+        self.vertex = esr.Tensor(
+            torch.arange(2, 38).reshape(-1, 2).double(), mode='partition'
+        )
+        self.edge = esr.Tensor(
+            torch.arange(2, 8).reshape(-1, 2).double(), mode='partition'
+        )
+        self.selector = esr.Selector(torch.arange(3) // 2)
+        self.reducer = esr.Reducer(torch.ones(3, dtype=torch.int64), n=18)
+        self.replica = esr.Tensor(
+            torch.zeros([1, 2]).double(), mode='replicate'
+        )
+
+    def forward(self):
+        self.edge[:] += self.selector(self.vertex)
+        self.edge[:] += torch.einsum('ij,ij->ij', self.edge, self.edge)
+
+        self.vertex[:] += self.reducer(self.edge)
+        self.vertex[:] += torch.einsum('ij,ij->ij', self.vertex, self.vertex)
+
+        self.replica[:] \
+            = esr.sum(self.edge) * 1.2 \
+            + esr.prod(self.edge) * 2.3 \
+            + esr.max(self.edge) * 3.4 \
+            + esr.min(self.edge) * 4.5 \
+            + esr.norm(self.edge, p=2)
 
 
-class TestJittedUsage:
+def worker__test_smoke_zerolength_notfull(local_rank, world_size, dev_type):
+    m = NotFullModel()
+    [jitted] = esr.compile([m], backend='none')
+    jitted()
+    jitted()
+    orig_v = jitted.vertex.clone().cpu()
+    orig_e = jitted.edge.clone().cpu()
+    orig_r = jitted.replica.clone().cpu()
 
-    @pytest.mark.parametrize('dev_type', [
-        'cpu',
-        pytest.param('cuda', marks=when_ngpus_ge_2)
-    ])
-    @pytest.mark.parametrize('jit_backend', [
-        'torch',
-        'cpu',
-        pytest.param('gpu', marks=when_ngpus_ge_2)
-    ])
-    def test_collect(self, dev_type: str, jit_backend: str):
-        mpirun_singlenode(2, worker__test_collect, (dev_type, jit_backend))
+    m = NotFullModel()
+    [jitted] = esr.compile([m], backend=dev_type)
+    jitted()
+    jitted()
+    collected_v = jitted.vertex.collect().cpu()
+    collected_e = jitted.edge.collect().cpu()
+    collected_r = jitted.replica.collect().cpu()
 
-    @pytest.mark.parametrize('dev_type', [
-        'cpu',
-        pytest.param('cuda', marks=when_ngpus_ge_2)
-    ])
-    def test_save(self, dev_type: str):
-        mpirun_singlenode(2, worker__test_save, (dev_type,))
+    torch.testing.assert_close(collected_v, orig_v)
+    torch.testing.assert_close(collected_e, orig_e)
+    torch.testing.assert_close(collected_r, orig_r)
+
+
+@pytest.mark.parametrize('dev_type', [
+    'cpu',
+    pytest.param('cuda', marks=when_ngpus_ge_2)
+])
+class TestZeroLengthPartition:
+    def test_zerolength_collect(self, dev_type):
+        torchrun_singlenode(
+            4 if dev_type == 'cpu' else 2,
+            worker__test_zerolength_collect, (dev_type,), init_type=dev_type
+        )
+
+    def test_zerolength_save(self, dev_type):
+        torchrun_singlenode(
+            4 if dev_type == 'cpu' else 2,
+            worker__test_zerolength_save, (dev_type,), init_type=dev_type
+        )
+
+    def test_smoke_zerolength_notfull(self, dev_type):
+        torchrun_singlenode(
+            4 if dev_type == 'cpu' else 2,
+            worker__test_smoke_zerolength_notfull,
+            (dev_type,),
+            init_type=dev_type
+        )
